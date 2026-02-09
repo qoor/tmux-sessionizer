@@ -15,20 +15,6 @@ PANE_CACHE_FILE="$PANE_CACHE_DIR/panes.cache"
 # TS_EXTRA_SEARCH_PATHS=(~/ghq:3 ~/Git:3 ~/.config:2)
 # # if set this override the TS_MAX_DEPTH (1)
 # TS_MAX_DEPTH=2
-# This is not meant to override .tmux-sessionizer.  At first i thought this
-# would be a good command, but i don't think its ackshually what i want.
-#
-# Instead, its a list of commands to run on windows who's index is way outside
-# of the first 10 windows.  This allows you to create as many windows in your
-# session as you would like without having your workflow interrupted by these
-# programatic windows
-#
-# how to use:
-# tmux-sessionizer -w 0 will execute the first command in window -t 69.
-# TS_SESSION_COMMANDS=(<cmd1> <cmd2>)
-#
-# TS_LOG=true # will write logs to ~/.local/share/tmux-sessionizer/tmux-sessionizer.logs
-# TS_LOG_FILE=<file> # will write logs to <file> Defaults to ~/.local/share/tmux-sessionizer/tmux-sessionizer.logs
 # ------------------------
 
 if [[ -f "$CONFIG_FILE" ]]; then
@@ -38,6 +24,12 @@ fi
 if [[ -f "$CONFIG_FILE_NAME" ]]; then
     source "$CONFIG_FILE_NAME"
 fi
+
+[[ -n "$TS_EXCLUDE_PATHS" ]] || TS_EXCLUDE_PATHS=(".git")
+FIND_EXCLUDE_ARGS=""
+for path in "${TS_EXCLUDE_PATHS[@]}"; do
+    FIND_EXCLUDE_ARGS="$FIND_EXCLUDE_ARGS -path '*/$path' -prune -o"
+done
 
 if [[ $TS_LOG != "true" ]]; then
     if [[ -z $TS_LOG_FILE ]]; then
@@ -213,9 +205,6 @@ sanity_check
 [[ -n "$TS_SEARCH_PATHS" ]] || TS_SEARCH_PATHS=(~/ ~/personal ~/personal/dev/env/.config)
 
 # Add any extra search paths to the TS_SEARCH_PATHS array
-# e.g : EXTRA_SEARCH_PATHS=("$HOME/extra1:4" "$HOME/extra2")
-# note : Path can be suffixed with :number to limit or extend the depth of the search for the Path
-
 if [[ ${#TS_EXTRA_SEARCH_PATHS[@]} -gt 0 ]]; then
     TS_SEARCH_PATHS+=("${TS_EXTRA_SEARCH_PATHS[@]}")
 fi
@@ -230,11 +219,12 @@ find_dirs() {
         tmux list-sessions -F "[TMUX] #{session_name}" 2>/dev/null
     fi
 
-    # note: TS_SEARCH_PATHS is an array of paths to search for directories
-    # if the path ends with :number, it will search for directories with a max depth of number ;)
-    # if there is no number, it will search for directories with a max depth defined by TS_MAX_DEPTH or 1 if not set
+    if [[ -f "$HOME/.ssh/config" ]]; then
+        # Use awk for better compatibility (handles indentation, case-insensitivity, and no grep -P dependency)
+        awk 'tolower($1) == "host" { for (i=2; i<=NF; i++) if ($i !~ /[*?]/) print "@SSH " $i }' "$HOME/.ssh/config"
+    fi
+
     for entry in "${TS_SEARCH_PATHS[@]}"; do
-        # Check if entry as :number as suffix then adapt the maxdepth parameter
         if [[ "$entry" =~ ^([^:]+):([0-9]+)$ ]]; then
             path="${BASH_REMATCH[1]}"
             depth="${BASH_REMATCH[2]}"
@@ -242,8 +232,35 @@ find_dirs() {
             path="$entry"
         fi
 
-        [[ -d "$path" ]] && find "$path" -mindepth 1 -maxdepth "${depth:-${TS_MAX_DEPTH:-1}}" -path '*/.git' -prune -o -type d -print
+        [[ -d "$path" ]] && find "$path" -mindepth 1 -maxdepth "${depth:-${TS_MAX_DEPTH:-1}}" $FIND_EXCLUDE_ARGS -type d -print
     done
+}
+
+# utility function to find remote directories
+find_remote_dirs() {
+    local ssh_host="$1"
+    local remote_cmds=""
+
+    # Do NOT list TMUX sessions (as per requirement)
+
+    for entry in "${TS_SEARCH_PATHS[@]}"; do
+        if [[ "$entry" =~ ^([^:]+):([0-9]+)$ ]]; then
+            path="${BASH_REMATCH[1]}"
+            depth="${BASH_REMATCH[2]}"
+        else
+            path="$entry"
+        fi
+
+        # Convert local $HOME to literal $HOME for remote execution
+        remote_path="${path/#$HOME/\$HOME}"
+
+        # Accumulate commands into a single string for SSH
+        # Keeps exact same structure: [[ -d path ]] && find ...
+        remote_cmds="$remote_cmds [[ -d \"$remote_path\" ]] && find \"$remote_path\" -mindepth 1 -maxdepth \"${depth:-${TS_MAX_DEPTH:-1}}\" $FIND_EXCLUDE_ARGS -type d -print;"
+    done
+
+    # Execute all commands on remote
+    ssh "$ssh_host" "$remote_cmds" 2>/dev/null
 }
 
 handle_session_cmd() {
@@ -325,20 +342,42 @@ if [[ -z $selected ]]; then
     exit 0
 fi
 
-if [[ "$selected" =~ ^\[TMUX\]\ (.+)$ ]]; then
+ssh_host=""
+if [[ "$selected" =~ ^@SSH\ (.+)$ ]]; then
+    ssh_host="${BASH_REMATCH[1]}"
+    
+    # Use the new function to find remote directories
+    remote_selected=$(find_remote_dirs "$ssh_host" | fzf)
+    
+    if [[ -z "$remote_selected" ]]; then
+        exit 0
+    fi
+    
+    selected="$remote_selected"
+    selected_name="${ssh_host}_$(basename "$selected" | tr . _)"
+elif [[ "$selected" =~ ^\[TMUX\]\ (.+)$ ]]; then
     selected="${BASH_REMATCH[1]}"
+    selected_name=$(basename "$selected" | tr . _)
+else
+    selected_name=$(basename "$selected" | tr . _)
 fi
 
-selected_name=$(basename "$selected" | tr . _)
-
 if ! is_tmux_running; then
-    tmux new-session -ds "$selected_name" -c "$selected"
-    hydrate "$selected_name" "$selected"
+    if [[ -n "$ssh_host" ]]; then
+        tmux new-session -ds "$selected_name" "ssh -t $ssh_host 'cd \"$selected\" && exec \$SHELL -l'"
+    else
+        tmux new-session -ds "$selected_name" -c "$selected"
+        hydrate "$selected_name" "$selected"
+    fi
 fi
 
 if ! has_session "$selected_name"; then
-    tmux new-session -ds "$selected_name" -c "$selected"
-    hydrate "$selected_name" "$selected"
+    if [[ -n "$ssh_host" ]]; then
+        tmux new-session -ds "$selected_name" "ssh -t $ssh_host 'cd \"$selected\" && exec \$SHELL -l'"
+    else
+        tmux new-session -ds "$selected_name" -c "$selected"
+        hydrate "$selected_name" "$selected"
+    fi
 fi
 
 switch_to "$selected_name"
